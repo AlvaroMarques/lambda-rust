@@ -1,0 +1,416 @@
+use std::{error::Error, intrinsics::unreachable, str::Chars};
+use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+enum Term {
+    Variable(String),
+    Lambda(),
+    Group(Vec<Term>),
+    Dot(),
+}
+
+use crate::Term::*;
+
+#[derive(Clone, Debug)]
+enum Subterm {
+    Basis(Term),
+    Application(Box<Subterm>, Box<Subterm>),
+    Abstraction(Box<Subterm>, Box<Subterm>),
+}
+
+impl Subterm {
+    fn basis(v: Term) -> Result<Subterm, Box<dyn Error>> {
+        match v {
+            Variable(name) => Ok(Subterm::Basis(Variable(name))),
+            _ => Err("Basis can only be variable".into()),
+        }
+    }
+    fn application(v1: Box<Subterm>, v2: Box<Subterm>) -> Result<Subterm, Box<dyn Error>> {
+        Ok(Subterm::Application(v1, v2))
+    }
+
+    fn abstraction(v1: Box<Subterm>, v2: Box<Subterm>) -> Result<Subterm, Box<dyn Error>> {
+        Ok(Subterm::Abstraction(v1, v2))
+    }
+}
+
+impl Term {
+    fn show(t: &Term) -> String {
+        match t {
+            Term::Dot() => String::from("."),
+            Term::Lambda() => String::from("\\"),
+            Term::Variable(name) => name.to_string(),
+            Term::Group(terms) => {
+                let terms_str_vec: Vec<String> = terms.iter().map(|tm| Term::show(tm)).collect();
+                format!("({})", terms_str_vec.join(""))
+            }
+        }
+    }
+
+    fn parse_ptr(ptr: &mut Chars<'_>, endchr: char) -> Vec<Self> {
+        match ptr.next() {
+            Some(chr) if chr == endchr => vec![],
+            None => vec![],
+            Some('.') => [vec![Term::Dot()], Term::parse_ptr(ptr, endchr)].concat(),
+            Some('\\') => [vec![Term::Lambda()], Term::parse_ptr(ptr, endchr)].concat(),
+            Some('(') => [
+                vec![Term::Group(Term::parse_ptr(ptr, ')'))],
+                Term::parse_ptr(ptr, endchr),
+            ]
+            .concat(),
+            Some(var) => [
+                vec![Term::Variable(String::from(var))],
+                Term::parse_ptr(ptr, endchr),
+            ]
+            .concat(),
+        }
+    }
+
+    fn parse(strcons: &str) -> Term {
+        let mut chars = strcons.chars();
+        Term::Group(Self::parse_ptr(&mut chars, '!'))
+    }
+
+    fn group_lambdas(terms: Vec<Term>) -> Vec<Term> {
+        match &terms[..] {
+            [Lambda(), Group(terms), Dot(), Lambda(), l2 @ Variable(_), rest @ ..] => {
+                Self::group_lambdas(
+                    [
+                        [Lambda(), Group([terms.clone(), vec![l2.clone()]].concat())].to_vec(),
+                        rest.to_vec(),
+                    ]
+                    .concat(),
+                )
+            }
+            [Lambda(), l1 @ Variable(_), l2 @ Variable(_), rest @ ..] => Self::group_lambdas(
+                [
+                    [Lambda(), Group(vec![l1.clone(), l2.clone()])].to_vec(),
+                    rest.to_vec(),
+                ]
+                .concat(),
+            ),
+            [Lambda(), l1 @ Variable(_), Dot(), Lambda(), l2 @ Variable(_), rest @ ..] => {
+                Self::group_lambdas(
+                    [
+                        [Lambda(), Group(vec![l1.clone(), l2.clone()])].to_vec(),
+                        rest.to_vec(),
+                    ]
+                    .concat(),
+                )
+            }
+            [Group(ts)] => [Group(Self::group_lambdas(ts.clone()))].to_vec(),
+            [any, rest @ ..] => [vec![any.clone()], Self::group_lambdas(rest.to_vec())].concat(),
+            [] => vec![],
+        }
+    }
+
+    fn group_applications(terms: Vec<Self>) -> Vec<Self> {
+        match &terms[..] {
+            [Lambda(), g @ Variable(..), Dot(), v1 @ Variable(..), v2 @ Variable(..), rest @ ..] => {
+                Self::group_applications(
+                    [
+                        vec![
+                            Lambda(),
+                            g.clone(),
+                            Dot(),
+                            Group(vec![v1.clone(), v2.clone()]),
+                        ],
+                        rest.to_vec(),
+                    ]
+                    .concat(),
+                )
+            }
+            [Lambda(), g @ Group(..), Dot(), v1 @ Variable(..), v2 @ Variable(..), rest @ ..] => {
+                Self::group_applications(
+                    [
+                        vec![
+                            Lambda(),
+                            g.clone(),
+                            Dot(),
+                            Group(vec![v1.clone(), v2.clone()]),
+                        ],
+                        rest.to_vec(),
+                    ]
+                    .concat(),
+                )
+            }
+            [Lambda(), g @ Variable(..), Dot(), app @ Group(..), v2 @ Variable(..), rest @ ..] => {
+                Self::group_applications(
+                    [
+                        vec![
+                            Lambda(),
+                            g.clone(),
+                            Dot(),
+                            Group(vec![app.clone(), v2.clone()]),
+                        ],
+                        rest.to_vec(),
+                    ]
+                    .concat(),
+                )
+            }
+            [Lambda(), g @ Group(..), Dot(), app @ Group(..), v2 @ Variable(..), rest @ ..] => {
+                Self::group_applications(
+                    [
+                        vec![
+                            Lambda(),
+                            g.clone(),
+                            Dot(),
+                            Group(vec![app.clone(), v2.clone()]),
+                        ],
+                        rest.to_vec(),
+                    ]
+                    .concat(),
+                )
+            }
+            [Group(ts)] => [Group(Self::group_applications(ts.clone()))].to_vec(),
+            [any, rest @ ..] => {
+                [vec![any.clone()], Self::group_applications(rest.to_vec())].concat()
+            }
+            _ => terms,
+        }
+    }
+
+    fn group(term: &Self) -> Self {
+        let abstraction_parsing = Group(Self::group_lambdas(vec![term.clone()]));
+        Group(Self::group_applications(vec![abstraction_parsing]))
+    }
+
+    fn into_subterms(term: &Self) -> Result<Subterm, Box<dyn Error>> {
+        match term {
+            v @ Variable(..) => Ok(Subterm::Basis(v.clone())),
+            Group(terms) => match &terms[..] {
+                [ts] => Self::into_subterms(&ts.clone()),
+                [x @ Variable(..), y @ Variable(..)] => Subterm::application(
+                    Box::new(Subterm::Basis(x.clone())),
+                    Box::new(Subterm::Basis(y.clone())),
+                ),
+                [x @ Variable(..), y @ Variable(..), Lambda(), rest @ ..] => Subterm::application(
+                    Box::new(Subterm::application(
+                        Box::new(Subterm::Basis(x.clone())),
+                        Box::new(Subterm::Basis(y.clone())),
+                    )?),
+                    Box::new(Self::into_subterms(&Group(
+                        [vec![Lambda()], rest.to_vec()].concat(),
+                    ))?),
+                ),
+                [x @ Group(..), y @ Variable(..)] => Subterm::application(
+                    Box::new(Self::into_subterms(&x.clone())?),
+                    Box::new(Subterm::Basis(y.clone())),
+                ),
+                [x @ Group(..), y @ Variable(..), Lambda(), rest @ ..] => Subterm::application(
+                    Box::new(Subterm::application(
+                        Box::new(Self::into_subterms(&x.clone())?),
+                        Box::new(Subterm::Basis(y.clone())),
+                    )?),
+                    Box::new(Self::into_subterms(&Group(
+                        [vec![Lambda()], rest.to_vec()].concat(),
+                    ))?),
+                ),
+                [x @ Group(..), y @ Group(..)] => Subterm::application(
+                    Box::new(Self::into_subterms(&x.clone())?),
+                    Box::new(Self::into_subterms(&y.clone())?),
+                ),
+                [x @ Group(..), y @ Group(..), Lambda(), rest @ ..] => Subterm::application(
+                    Box::new(Subterm::application(
+                        Box::new(Self::into_subterms(&x.clone())?),
+                        Box::new(Self::into_subterms(&y.clone())?),
+                    )?),
+                    Box::new(Self::into_subterms(&Group(
+                        [vec![Lambda()], rest.to_vec()].concat(),
+                    ))?),
+                ),
+                [x @ Variable(..), y @ Group(..)] => Subterm::application(
+                    Box::new(Subterm::Basis(x.clone())),
+                    Box::new(Self::into_subterms(&y.clone())?),
+                ),
+                [x @ Variable(..), y @ Group(..), Lambda(), rest @ ..] => Subterm::application(
+                    Box::new(Subterm::application(
+                        Box::new(Subterm::Basis(x.clone())),
+                        Box::new(Self::into_subterms(&y.clone())?),
+                    )?),
+                    Box::new(Self::into_subterms(&Group(
+                        [vec![Lambda()], rest.to_vec()].concat(),
+                    ))?),
+                ),
+                [Lambda(), x @ Group(..), Dot(), y @ Variable(..)] => Subterm::abstraction(
+                    Box::new(Self::into_subterms(&x.clone())?),
+                    Box::new(Subterm::Basis(y.clone())),
+                ),
+                [Lambda(), x @ Group(..), Dot(), y @ Variable(..), Lambda(), rest @ ..] => {
+                    Subterm::application(
+                        Box::new(Subterm::abstraction(
+                            Box::new(Self::into_subterms(&x.clone())?),
+                            Box::new(Subterm::Basis(y.clone())),
+                        )?),
+                        Box::new(Self::into_subterms(&Group(
+                            [vec![Lambda()], rest.to_vec()].concat(),
+                        ))?),
+                    )
+                }
+                [Lambda(), x @ Variable(..), Dot(), y @ Variable(..)] => Subterm::abstraction(
+                    Box::new(Subterm::Basis(x.clone())),
+                    Box::new(Subterm::Basis(y.clone())),
+                ),
+
+                [Lambda(), x @ Variable(..), Dot(), y @ Variable(..), Lambda(), rest @ ..] => {
+                    Subterm::application(
+                        Box::new(Subterm::abstraction(
+                            Box::new(Subterm::Basis(x.clone())),
+                            Box::new(Subterm::Basis(y.clone())),
+                        )?),
+                        Box::new(Self::into_subterms(&Group(
+                            [vec![Lambda()], rest.to_vec()].concat(),
+                        ))?),
+                    )
+                }
+                [Lambda(), x @ Variable(..), Dot(), y @ Group(..)] => Subterm::abstraction(
+                    Box::new(Subterm::Basis(x.clone())),
+                    Box::new(Self::into_subterms(&y.clone())?),
+                ),
+                [Lambda(), x @ Variable(..), Dot(), y @ Group(..), Lambda(), rest @ ..] => {
+                    Subterm::application(
+                        Box::new(Subterm::abstraction(
+                            Box::new(Subterm::Basis(x.clone())),
+                            Box::new(Self::into_subterms(&y.clone())?),
+                        )?),
+                        Box::new(Self::into_subterms(&Group(
+                            [vec![Lambda()], rest.to_vec()].concat(),
+                        ))?),
+                    )
+                }
+                [Lambda(), x @ Group(..), Dot(), y @ Group(..), Lambda(), rest @ ..] => {
+                    Subterm::application(
+                        Box::new(Subterm::abstraction(
+                            Box::new(Self::into_subterms(&x.clone())?),
+                            Box::new(Self::into_subterms(&y.clone())?),
+                        )?),
+                        Box::new(Self::into_subterms(&Group(
+                            [vec![Lambda()], rest.to_vec()].concat(),
+                        ))?),
+                    )
+                }
+                [Lambda(), x @ Group(..), Dot(), y @ Group(..)] => Subterm::abstraction(
+                    Box::new(Subterm::Basis(x.clone())),
+                    Box::new(Self::into_subterms(&y.clone())?),
+                ),
+                _ => Err(format!("Unexpected group: {:?}", term.clone()).into()),
+            },
+            _ => Err(format!("Unexpected term: {:?}", term).into()),
+        }
+    }
+}
+
+impl Subterm {
+    fn basis_tag(uidv4: String, name: String) -> Vec<String> {
+        vec![format!("Basis_{}: \"{}\"", uidv4, name)]
+    }
+    fn basis_point(uidv4: String, root: Option<String>) -> Vec<String> {
+        match root {
+            None => vec![],
+            Some(root_value) => vec![format!("Basis_{} -> {}", uidv4, root_value)],
+        }
+    }
+    fn abs_tag(uidv4_1: String, uidv4_2: String, root: Option<String>) -> Vec<String> {
+        let init_value = vec![
+            format!("Lambda_{}", uidv4_1),
+            format!("Lambda_{}", uidv4_2),
+            format!("Lambda_{}: \"λ\"", uidv4_1),
+            format!("Lambda_{}: \"λ\"", uidv4_2),
+        ];
+        match root {
+            None => init_value,
+            Some(root_value) => [
+                init_value,
+                vec![
+                    format!("Lambda_{} -> {}", uidv4_1, root_value),
+                    format!("Lambda_{} -> {}", uidv4_2, root_value),
+                ],
+            ]
+            .concat(),
+        }
+    }
+
+    fn app_tag(uidv4_1: String, uidv4_2: String, root: Option<String>) -> Vec<String> {
+        let init_value = vec![
+            format!("App_{}", uidv4_1),
+            format!("App_{}", uidv4_2),
+            format!("App_{}: \".\"", uidv4_1),
+            format!("App_{}: \".\"", uidv4_2),
+        ];
+        match root {
+            None => init_value,
+            Some(root_value) => [
+                init_value,
+                vec![
+                    format!("App_{} -> {}", uidv4_1, root_value),
+                    format!("App_{} -> {}", uidv4_2, root_value),
+                ],
+            ]
+            .concat(),
+        }
+    }
+
+    fn random_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn show_tree(sub: Subterm, root: Option<String>) -> Vec<String> {
+        match sub {
+            Subterm::Basis(Variable(name)) => match root {
+                None => Self::basis_tag(Self::random_id(), name),
+                Some(value) => {
+                    let id_ = Self::random_id();
+                    [
+                        Self::basis_tag(&id_, name),
+                        Self::basis_point(&id_, Some(value)),
+                    ]
+                    .concat()
+                }
+            },
+            Subterm::Abstraction(term1, term2) => match (term1.as_ref(), term2.as_ref()) {
+                _ => {
+                    let id1 = Self::random_id();
+                    let id2 = Self::random_id();
+                    let [v1, v2, rest @ ..] = &Self::abs_tag(id1, id2, root)[..] else {
+                        unreachable!("something fishy is going on!")
+                    };
+                    [
+                        rest.clone(),
+                        &Self::show_tree(*term1, Some(v1.clone())),
+                        &Self::show_tree(*term2, Some(v2.clone())),
+                    ]
+                    .concat()
+                }
+            },
+            Subterm::Application(term1, term2) => match (term1.as_ref(), term2.as_ref()) {
+                _ => {
+                    let id1 = Self::random_id();
+                    let id2 = Self::random_id();
+                    let [v1, v2, rest @ ..] = &Self::app_tag(id1, id2, root)[..] else {
+                        unreachable!("something fishy is going on!")
+                    };
+                    [
+                        rest.clone(),
+                        &Self::show_tree(*term1, Some(v1.clone())),
+                        &Self::show_tree(*term2, Some(v2.clone())),
+                    ]
+                    .concat()
+                }
+            },
+            _ => unreachable!("{}", format!("A invalid subterm was used: {:?}", sub)),
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let term = Term::parse("\\xy.xz\\u.uw");
+    println!("{:?}", term);
+    let grouped = Term::group(&term);
+    println!("{:?}", grouped);
+    println!("{}", Term::show(&term));
+    println!("{}", Term::show(&grouped));
+    let st = Term::into_subterms(&grouped)?;
+    println!("{:?}", st);
+    println!("{}", Subterm::show_tree(st, 0).join("\n"));
+    Ok(())
+}
